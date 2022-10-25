@@ -81,7 +81,7 @@ static struct Global {
 } g;
 
 #include <stdio.h>      /* vsnprintf */
-void printf(const char *fmt, ...)
+void sgxprintf(const char *fmt, ...)
 {
     char buf[BUFSIZ] = {'\0'};
     va_list ap;

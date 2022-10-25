@@ -1,18 +1,14 @@
-SGX_SDK ?= /opt/intel/sgxsdk
+CXX = clang++
+CC = clang
+LD = lld
+SGX_SDK ?= $(abspath ../../SGXSan/install)
 #SGX_SDK ?= /path/to/the/sgxsdk
-SGX_MODE ?= HW
+SGX_MODE ?= SIM
 SGX_ARCH ?= x64
 SGX_DEBUG ?= 1
 
 ifeq ($(SGX_SDK),/path/to/the/sgxsdk)
     $(error "SGX_SDK is not set ")
-endif
-
-
-ifeq ($(shell getconf LONG_BIT), 32)
-	SGX_ARCH := x86
-else ifeq ($(findstring -m32, $(CXXFLAGS)), -m32)
-	SGX_ARCH := x86
 endif
 
 ifeq ($(SGX_ARCH), x86)
@@ -34,7 +30,7 @@ endif
 endif
 
 ifeq ($(SGX_DEBUG), 1)
-		SGX_COMMON_CFLAGS += -O2
+		SGX_COMMON_CFLAGS += -O0 -g
 else
 		SGX_COMMON_CFLAGS += -O2
 endif
@@ -50,7 +46,11 @@ endif
 App_Cpp_Files := App/App.cpp App/sgx_utils/sgx_utils.cpp
 App_Include_Paths := -IApp -I$(SGX_SDK)/include
 
-App_C_Flags := $(SGX_COMMON_CFLAGS) -fPIC -Wno-attributes $(App_Include_Paths)
+App_C_Flags := $(SGX_COMMON_CFLAGS) $(App_Include_Paths) \
+	-flegacy-pass-manager \
+	-Xclang -load -Xclang $(SGX_SDK)/lib64/libSGXFuzzerPass.so \
+	-mllvm -edl-json=Enclave/Enclave.edl.json \
+	-fsanitize-coverage=inline-8bit-counters
 
 # Three configuration modes - Debug, prerelease, release
 #   Debug - Macro DEBUG enabled.
@@ -65,7 +65,14 @@ else
 endif
 
 App_Cpp_Flags := $(App_C_Flags) -std=c++11
-App_Link_Flags := $(SGX_COMMON_CFLAGS) -L$(SGX_LIBRARY_PATH) -l$(Urts_Library_Name) -lpthread  -lrdmacm -libverbs
+App_Link_Flags := $(SGX_COMMON_CFLAGS) -L$(SGX_LIBRARY_PATH) -l$(Urts_Library_Name) -lpthread \
+	-lrdmacm -libverbs \
+	-ldl \
+	-Wl,-rpath=$(shell pwd) \
+	-Wl,-rpath=/opt/intel/sgxsdk/lib64 \
+	-lSGXFuzzerRT \
+	-fsanitize=fuzzer \
+	-lcrypto -lboost_program_options
 
 ifneq ($(SGX_MODE), HW)
 	App_Link_Flags += -lsgx_uae_service_sim
@@ -96,14 +103,28 @@ Enclave_Include_Paths := -IEnclave -I$(SGX_SDK)/include -I$(SGX_SDK)/include/tli
 #SQLITE_FLAGS :=  -DSQLITE_THREADSAFE=0  -DSQLITE_ENABLE_MEMSYS5 -DSQLITE_OMIT_WAL  -DSQLITE_PCACHE_SEPARATE_HEADER -DWITH_IPP
 SQLITE_FLAGS :=  -DSQLITE_THREADSAFE=0 -DSQLITE_ENABLE_MEMSYS5 -DSQLITE_PCACHE_SEPARATE_HEADER
 
-Enclave_C_Flags := $(SGX_COMMON_CFLAGS) $(SQLITE_FLAGS) -nostdinc -fvisibility=hidden -fpie -fstack-protector $(Enclave_Include_Paths)
-Enclave_Cpp_Flags := $(Enclave_C_Flags)  -nostdinc++
-Enclave_Link_Flags := $(SGX_COMMON_CFLAGS) -Wl,--no-undefined -nostdlib -nodefaultlibs -nostartfiles -L$(SGX_LIBRARY_PATH) \
-	-Wl,--whole-archive -l$(Trts_Library_Name) -Wl,--no-whole-archive \
-	-Wl,--start-group -lsgx_tstdc -lsgx_tcxx -l$(Crypto_Library_Name) -l$(Service_Library_Name) -Wl,--end-group \
-	-Wl,-Bstatic -Wl,-Bsymbolic -Wl,--no-undefined \
-	-Wl,-pie,-eenclave_entry -Wl,--export-dynamic  \
-	-Wl,--defsym,__ImageBase=0 
+Enclave_C_Flags := $(SGX_COMMON_CFLAGS) $(SQLITE_FLAGS) -fvisibility=hidden -fpie -fstack-protector $(Enclave_Include_Paths) \
+	-flto -fno-discard-value-names \
+	-fsanitize-coverage=inline-8bit-counters
+
+Enclave_Cpp_Flags := $(Enclave_C_Flags)
+
+Enclave_Link_Flags := $(SGX_COMMON_CFLAGS) -L$(SGX_LIBRARY_PATH) \
+	-nostdlib -nodefaultlibs -nostartfiles  \
+	-Wl,--whole-archive -lSGXSanRT -l$(Trts_Library_Name) -Wl,--no-whole-archive \
+	-Wl,--start-group -lsgx_tsafecrt -l$(Crypto_Library_Name) -l$(Service_Library_Name) -Wl,--end-group \
+	-Wl,-Bstatic -Wl,-Bsymbolic \
+	-Wl,-eenclave_entry -Wl,--export-dynamic  \
+	-Wl,--defsym,__ImageBase=0 \
+	-Wl,--version-script=Enclave/Enclave.lds \
+	-fuse-ld=$(LD) \
+	-Wl,-save-temps \
+	-Wl,--lto-legacy-pass-manager \
+	-Wl,-mllvm=-load=$(SGX_SDK)/lib64/libSGXSanPass.so \
+	-Wl,-mllvm=-edl-json=Enclave/Enclave.edl.json \
+	-Wl,-mllvm=-enable-slsan=false \
+	-Wl,-mllvm=--stat=false \
+	--shared
 
 Enclave_C_Objects := $(Enclave_C_Files:.c=.o)
 
@@ -142,11 +163,13 @@ endif
 
 ######## App Objects ########
 
-App/Enclave_u.c: $(SGX_EDGER8R) Enclave/Enclave.edl
+App/Enclave_u.h: Enclave/Enclave.edl
 	@cd App && $(SGX_EDGER8R) --untrusted ../Enclave/Enclave.edl --search-path ../Enclave --search-path $(SGX_SDK)/include
 	@echo "GEN  =>  $@"
 
-App/Enclave_u.o: App/Enclave_u.c
+App/Enclave_u.c: App/Enclave_u.h
+
+App/Enclave_u.o: App/Enclave_u.c Enclave/Enclave.edl.json
 	@$(CC) $(App_C_Flags) -c $< -o $@
 	@echo "CC   <=  $<"
 
@@ -154,16 +177,20 @@ App/%.o: App/%.cpp
 	@$(CXX) $(App_Cpp_Flags) -c $< -o $@
 	@echo "CXX  <=  $<"
 
-$(App_Name): App/Enclave_u.o $(App_Cpp_Objects)
+$(App_Name): App/Enclave_u.o enclave.so
 	@$(CXX) $^ -o $@ $(App_Link_Flags)
 	@echo "LINK =>  $@"
 
 
 ######## Enclave Objects ########
 
-Enclave/Enclave_t.c: $(SGX_EDGER8R) Enclave/Enclave.edl
+Enclave/Enclave.edl.json: Enclave/Enclave_t.h
+
+Enclave/Enclave_t.h: Enclave/Enclave.edl
 	@cd Enclave && $(SGX_EDGER8R) --trusted ../Enclave/Enclave.edl --search-path ../Enclave --search-path $(SGX_SDK)/include
 	@echo "GEN  =>  $@"
+
+Enclave/Enclave_t.c: Enclave/Enclave_t.h
 
 Enclave/Enclave_t.o: Enclave/Enclave_t.c
 	@$(CC) $(Enclave_C_Flags) -c $< -o $@
@@ -173,15 +200,15 @@ Enclave/%.o: Enclave/%.c
 	$(CC) $(Enclave_C_Flags) -c  $< -o $@
 	@echo "CC  <=  $<"
 
-$(Enclave_Name): Enclave/Enclave_t.o $(Enclave_C_Objects)
-	$(CC)  $^ -o $@ $(Enclave_Link_Flags)
+$(Enclave_Name): Enclave/Enclave_t.o $(Enclave_C_Objects) Enclave/Enclave.edl.json
+	$(CC) $(filter-out Enclave/Enclave.edl.json,$^) -o $@ $(Enclave_Link_Flags)
 	@echo "LINK =>  $@"
 
 $(Signed_Enclave_Name): $(Enclave_Name)
-	@$(SGX_ENCLAVE_SIGNER) sign -key Enclave/Enclave_private.pem -enclave $(Enclave_Name) -out $@ -config $(Enclave_Config_File)
+# @$(SGX_ENCLAVE_SIGNER) sign -key Enclave/Enclave_private.pem -enclave $(Enclave_Name) -out $@ -config $(Enclave_Config_File)
 	@echo "SIGN =>  $@"
 
 .PHONY: clean
 
 clean:
-	@rm -f $(App_Name) $(Enclave_Name) $(Signed_Enclave_Name) $(App_Cpp_Objects) App/Enclave_u.* $(Enclave_C_Objects)  Enclave/Enclave_t.*
+	@rm -f $(App_Name) $(Enclave_Name) $(Signed_Enclave_Name) $(App_Cpp_Objects) App/Enclave_u.* $(Enclave_C_Objects)  Enclave/Enclave_t.* Enclave/Enclave.edl.json *.bc enclave.so.lto.o enclave.so.resolution.txt

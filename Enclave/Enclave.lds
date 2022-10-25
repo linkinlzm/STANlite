@@ -1,0 +1,14 @@
+enclave.so
+{
+    global:
+        g_global_data_sim;
+        g_global_data;
+        enclave_entry;
+        sgx_ecall;
+        sgx_ecall_switchless;
+        sgx_create_enclave;
+        sgx_create_enclave_ex;
+        sgx_destroy_enclave;
+    local:
+        *;
+};
